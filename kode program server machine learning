@@ -1,0 +1,187 @@
+import pandas as pd
+import numpy as np
+import joblib
+import requests
+import time
+import urllib.parse
+
+# ==================== BLYNK CONFIGURATION ====================
+BLYNK_TOKEN = "xxxxxxxxxxxxxxxxx"
+BASE_URL = "https://SGP1.blynk.cloud/external/api"
+CHECK_INTERVAL = 1  
+# ==============================================================
+
+SENSOR_COLUMNS = [
+    'L1-n Volt', 'L2-N Volt', 'L3-N Volt', 'L1-L2 Volt', 'L2-L3 Volt', 'L3-L1 Volt', 
+    'L1 current', 'L2 Current', 'L3 Current', 'L1 Watt', 'L2 Watt', 'L3 Watt', 
+    'L1 VA', 'L2 VA', 'L3 VA', 'L1 VAr', 'L2 Var', 'L3 Var'
+]
+
+print("--- PHASE 2: RUNNING LIVE SIMULATION ---")
+
+try:
+    system_bundle = joblib.load('genset_model.pkl')
+    model = system_bundle['model']
+    normal_mean = system_bundle['healthy_mean']
+    normal_std = system_bundle['healthy_std']
+    print("✅ Successfully loaded updated 'genset_model.pkl'")
+except FileNotFoundError:
+    print("❌ Error: Could not find 'genset_model.pkl'.")
+    exit()
+
+test_file = 'test data ta(2).csv' 
+df_raw = pd.read_csv(test_file, sep=';')
+if len(df_raw.columns) <= 1:
+    df_raw = pd.read_csv(test_file, sep=',')
+
+timestamp_candidates = [col for col in df_raw.columns if col.lower() == 'timestamp']
+if not timestamp_candidates:
+    print("❌ Error: Timestamp missing.")
+    exit()
+
+df_sim = pd.DataFrame()
+df_sim['Timestamp'] = df_raw[timestamp_candidates[0]]
+
+for col in SENSOR_COLUMNS:
+    if col in df_raw.columns:
+        df_sim[col] = df_raw[col].apply(lambda x: float(str(x).split(',')[0]) if pd.notnull(x) and str(x).strip() != '' else 0.0)
+    else:
+        df_sim[col] = 0.0
+
+df_sim = df_sim.reset_index(drop=True)
+print(f"📦 Simulation engine ready with {len(df_sim)} test cycles.")
+
+def get_blynk_value(pin):
+    try:
+        url = f"{BASE_URL}/get?token={BLYNK_TOKEN}&{pin}"
+        response = requests.get(url, timeout=2)
+        if response.status_code != 200:
+            return 0.0
+        data = response.json()
+        if isinstance(data, list): return float(data[0])
+        return float(data)
+    except: 
+        return 0.0
+
+def update_blynk_value(pin, value):
+    try: 
+        url = f"{BASE_URL}/update?token={BLYNK_TOKEN}&{pin}={value}"
+        requests.get(url, timeout=2)
+    except: 
+        pass
+
+def trigger_blynk_event(event_code, description):
+    try:
+        safe_description = urllib.parse.quote(description)
+        requests.get(f"{BASE_URL}/logEvent?token={BLYNK_TOKEN}&code={event_code}&description={safe_description}", timeout=3)
+    except Exception as e: print(f"⚠️ Notification failed: {e}")
+
+current_row = 0
+is_running = False
+
+update_blynk_value("V3", 0)
+update_blynk_value("V4", 1)
+update_blynk_value("V5", 0)
+
+print("\n📡 Server online. Turn on via Blynk app...")
+
+while True:
+    start_cmd = get_blynk_value("V0")
+    stop_cmd = get_blynk_value("V10")
+    
+    if start_cmd == 1.0 and not is_running:
+        is_running = True
+        update_blynk_value("V3", 1)
+        update_blynk_value("V4", 0)
+        update_blynk_value("V5", 0)
+        print("\n▶️ RUNNING...")
+        
+    elif stop_cmd == 1.0 and is_running:
+        is_running = False
+        update_blynk_value("V3", 0)
+        update_blynk_value("V4", 1)
+        print("\n⏹️ PAUSED.")
+
+    if is_running:
+        row = df_sim.iloc[current_row]
+        timestamp = row['Timestamp']
+        X_live = row[SENSOR_COLUMNS].values.reshape(1, -1)
+        
+        # Engine 1: Machine Learning Prediction
+        prediction = int(model.predict(X_live)[0])
+
+        # Engine 2: Deterministic 100 kVA Fault Protection Relay Rules
+        abnormal_parts = []
+        for col in SENSOR_COLUMNS:
+            col_lower = col.lower()
+            val = row[col]
+
+            # 🚨 IGNORE POWER METRICS (WATT, VA, VAr) FOR NOW
+            if col_lower in [
+                'l1 watt', 'l2 watt', 'l3 watt', 
+                'l1 va', 'l2 va', 'l3 va', 
+                'l1 var', 'l2 var', 'l3 var'
+            ]:
+                continue
+
+            # 🛑 1. PHASE-TO-NEUTRAL FAULTS (L1-N, L2-N, L3-N)
+            if col_lower in ['l1-n volt', 'l2-n volt', 'l3-n volt']:
+                if val < 20.0:  # Voltage severely drops
+                    abnormal_parts.append(f"Loss of Phase Voltage on {col} ({val:.1f}V)")
+                elif val < 207.0: # -10% Undervoltage limit
+                    abnormal_parts.append(f"Undervoltage on {col} ({val:.1f}V)")
+                elif val > 253.0: # +10% Overvoltage limit
+                    abnormal_parts.append(f"Overvoltage on {col} ({val:.1f}V)")
+
+            # 🛑 2. LINE-TO-LINE FAULTS (L1-L2, L2-L3, L3-L1)
+            elif col_lower in ['l1-l2 volt', 'l2-l3 volt', 'l3-l1 volt']:
+                if val < 100.0:  # Phase-to-Phase short circuit collapse
+                    abnormal_parts.append(f"Line-to-Line Fault on {col} ({val:.1f}V)")
+
+            # 🛑 3. CURRENT & GROUND FAULTS (L1, L2, L3 Current)
+            elif col_lower in ['l1 current', 'l2 current', 'l3 current']:
+                if val > 200.0:  # Exceeds 100 kVA Full Load Rating (~144A) significantly
+                    abnormal_parts.append(f"Line-to-Ground Fault / Surge on {col} ({val:.1f}A)")
+                elif val <= 0.05: # Total loss of current
+                    abnormal_parts.append(f"Open Circuit on {col} ({val:.1f}A)")
+            
+            # 🛑 4. POWER PARAMETERS FALLBACK (Bypassed while metrics are ignored)
+            else:
+                z_score = (val - normal_mean[col]) / normal_std[col]
+                if 'var' in col_lower: unit = "VAr"
+                elif 'va' in col_lower: unit = "VA"
+                else: unit = ""
+
+                if z_score > 3.0:
+                    abnormal_parts.append(f"Load Overload on {col} ({val:.1f}{unit})")
+                elif z_score < -3.0 or val <= 0.05:
+                    abnormal_parts.append(f"Loss of Load on {col} ({val:.1f}{unit})")
+
+        # ================= SYSTEM EVALUATION MATRIX =================
+        if not abnormal_parts and prediction == 1:
+            # Baris ini telah diubah sesuai request Anda:
+            print(f"🟢 [{timestamp}] System Normal.")
+            update_blynk_value("V5", 0)
+        
+        else:
+            update_blynk_value("V5", 1)  # Fire Blynk Red Alarm LED
+            
+            if abnormal_parts:
+                culprits = " | ".join(abnormal_parts)
+                alert_msg = f"Fault at {timestamp}: {culprits}"
+                print(f"🔴 ANOMALY DETECTED -> {alert_msg}")
+                trigger_blynk_event("fault_alert", alert_msg)
+                
+                # Critical Safety Trip Logic updated for specific faults
+                critical_keywords = ["Loss of Phase Voltage", "Line-to-Line Fault", "Line-to-Ground", "Open Circuit"]
+                if any(fault in alert_msg for fault in critical_keywords):
+                    is_running = False
+                    update_blynk_value("V3", 0)
+                    update_blynk_value("V4", 1)
+                    print("⚠️ System safely tripped due to Critical Electrical Hazard.")
+            else:
+                print(f"🟡 [{timestamp}] L1-n Volt: {row['L1-n Volt']:.1f}V | Machine Learning flagged unclassified parameter drift.")
+
+        current_row = (current_row + 1) % len(df_sim)
+
+    time.sleep(CHECK_INTERVAL)
